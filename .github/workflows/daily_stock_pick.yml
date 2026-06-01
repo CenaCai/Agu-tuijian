@@ -1,0 +1,43 @@
+name: 每日 A 股选股推送
+
+on:
+  schedule:
+    - cron: '0 12 * * *' # UTC 12:00 = 北京时间 20:00
+  workflow_dispatch: # 允许手动触发
+
+permissions:
+  contents: write
+
+jobs:
+  run-and-commit:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # 获取完整历史，便于后续 push
+
+      - name: 设置 Python 环境
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: 安装依赖
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: 运行选股脚本
+        run: |
+          python scripts/run_selection.py --date $(date +%Y-%m-%d)
+          echo "选股完成，结果在 results/ 目录"
+
+      - name: 提交并推送结果
+        uses: Endbug/add-and-commit@v9
+        with:
+          default_author_email: "bot@users.noreply.github.com"
+          default_author_name: "schedule-bot"
+          message: "🤖 自动更新选股结果 (${{ github.run_date }})"
+          add: "results/*.json"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
