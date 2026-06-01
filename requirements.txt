@@ -1,7 +1,4 @@
-# Sequoia-X（如果你的环境支持 pip install）
-sequoia-x>=0.1.0
-
-# 备用：使用 AKShare 作为数据源（免费 A 股 API）
+# 使用 AKShare 作为数据源（免费 A 股 API）
 akshare>=1.13.0
 
 # 通用数据分析包
