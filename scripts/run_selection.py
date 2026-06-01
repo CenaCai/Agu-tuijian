@@ -72,7 +72,6 @@ def ma(series, period):
 
 
 def compute_atr(high, low, close, period=5):
-    """短期ATR（用于衡量5日内预期波动）"""
     h = high.values
     l = low.values
     c = close.values
@@ -86,17 +85,16 @@ def compute_atr(high, low, close, period=5):
 
 
 def pct_change_from_period(df, col="close", period=5):
-    """计算N日涨幅"""
     if len(df) < period + 1:
         return 0.0
     return (float(df[col].iloc[-1]) / float(df[col].iloc[-(period+1)])) - 1
 
 
 # ═══════════════════════════════════════════════════════════
-# 数据获取（保持原有的双接口+重试机制）
+# 数据获取（三接口+重试机制）
 # ═══════════════════════════════════════════════════════════
 def get_all_stocks():
-    fetchers = [_fetch_from_spot_em, _fetch_from_push2]
+    fetchers = [_fetch_from_spot_em, _fetch_from_push2, _fetch_from_ak_list]
     last_err = None
     for fetcher in fetchers:
         for attempt in range(1, MAX_RETRIES + 2):
@@ -143,10 +141,15 @@ def _fetch_from_push2():
         "fields": "f2,f3,f6,f7,f12,f14,f15,f16,f17,f20",
     }
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         "Referer": "https://quote.eastmoney.com/",
+        "Accept": "*/*",
+        "Accept-Encoding": "gzip, deflate",
+        "Connection": "keep-alive",
     }
     resp = requests.get(url, params=params, headers=headers, timeout=30)
+    if resp.status_code != 200 or not resp.text:
+        raise ValueError(f"push2 返回异常: HTTP {resp.status_code}, body={resp.text[:200]}")
     data = resp.json()
     stocks = []
     for item in data.get("data", {}).get("diff", []):
@@ -168,6 +171,28 @@ def _fetch_from_push2():
                 "close": close_price, "amount": amount, "p_change": p_change / 100,
             })
     print(f"  [*] [push2] 获取到 {len(stocks)} 只股票（轻量接口）")
+    return stocks
+
+
+def _fetch_from_ak_list():
+    try:
+        df = ak.stock_info_a_code_name()
+    except Exception:
+        try:
+            df = ak.stock_zh_a_spot_em()
+        except Exception:
+            return []
+    stocks = []
+    if df is not None and not df.empty:
+        for _, row in df.iterrows():
+            code_col = "代码" if "代码" in df.columns else "code"
+            name_col = "名称" if "名称" in df.columns else "name"
+            code = str(row.get(code_col, "")).zfill(6)
+            name = str(row.get(name_col, ""))
+            if not code or not name:
+                continue
+            stocks.append({"code": code, "name": name, "nmc": 0, "close": 0, "amount": 0, "p_change": 0})
+    print(f"  [*] [ak_list] 获取到 {len(stocks)} 只股票（纯代码列表，市值筛选延后）")
     return stocks
 
 
@@ -195,10 +220,6 @@ def get_stock_hist(code, days=300):
 # 核心筛选逻辑 — 5日5%策略
 # ═══════════════════════════════════════════════════════════
 def screen_stock(code, name, stock_info, df) -> dict | None:
-    """
-    综合筛选一只股票是否满足5日5%策略条件。
-    返回包含评分和价格信息的字典，不满足返回None。
-    """
     if len(df) < 40:
         return None
 
@@ -209,20 +230,17 @@ def screen_stock(code, name, stock_info, df) -> dict | None:
     low = float(last["low"])
     amount = float(last["amount"])
 
-    # ── 第1层：基础检查 ──
-    # 成交额
+    # 第1层：基础检查
     if amount < MIN_AMOUNT:
         return None
 
-    # 当日涨幅不能太大（追高风险）
     today_change = float(last.get("p_change", 0)) if pd.notna(last.get("p_change", 0)) else 0
     if abs(today_change) > MAX_DAILY_CHANGE * 100:
         return None
 
-    # ── 第2层：排除规则 ──
+    # 第2层：排除规则
     tail5 = df.tail(5)
 
-    # 排除连续跌3天以上
     consecutive_drop = 0
     for _, row in tail5.iterrows():
         chg = float(row.get("p_change", 0)) if pd.notna(row.get("p_change", 0)) else 0
@@ -233,14 +251,12 @@ def screen_stock(code, name, stock_info, df) -> dict | None:
     if consecutive_drop > MAX_CONSECUTIVE_DROP:
         return None
 
-    # 排除近5日有跌停（跌幅>9.5%）
     if DOWNTICK_IN_5D:
         for _, row in tail5.iterrows():
             chg = float(row.get("p_change", 0)) if pd.notna(row.get("p_change", 0)) else 0
             if chg < -9.5:
                 return None
 
-    # 排除单日振幅过大
     recent = df.tail(10)
     for _, row in recent.iterrows():
         h = float(row["high"])
@@ -248,7 +264,7 @@ def screen_stock(code, name, stock_info, df) -> dict | None:
         if l > 0 and (h - l) / l > MIN_HIGH_LOW_SPREAD:
             return None
 
-    # ── 第3层：动量确认 ──
+    # 第3层：动量确认
     ret_5d = pct_change_from_period(df, "close", 5)
     ret_20d = pct_change_from_period(df, "close", 20)
 
@@ -257,19 +273,19 @@ def screen_stock(code, name, stock_info, df) -> dict | None:
     if ret_20d < MIN_20D_RETURN:
         return None
 
-    # ── 第4层：波动率适配 ──
+    # 第4层：波动率适配
     atr_series = compute_atr(df["high"], df["low"], df["close"], 5)
     if atr_series.empty:
         return None
     atr_5d = float(atr_series.iloc[-1])
     if atr_5d <= 0:
         return None
-    atr_pct = atr_5d / close  # ATR占价格的比例
+    atr_pct = atr_5d / close
 
     if atr_pct < ATR_PCT_MIN or atr_pct > ATR_PCT_MAX:
         return None
 
-    # ── 第5层：趋势+支撑 ──
+    # 第5层：趋势+支撑
     df_ext = df.copy()
     df_ext["ma20"] = ma(df_ext["close"], 20)
     df_ext["ma30"] = ma(df_ext["close"], 30)
@@ -279,12 +295,10 @@ def screen_stock(code, name, stock_info, df) -> dict | None:
         return None
     current_ma20 = float(last_ma20.iloc[-1])
 
-    # 站上MA20，且偏离不超过3%
     dist_ma20 = abs(close - current_ma20) / current_ma20
     if dist_ma20 > MAX_DIST_MA20 or close < current_ma20:
         return None
 
-    # MA30斜率向上
     last_ma30 = df_ext["ma30"].dropna()
     if last_ma30.empty:
         return None
@@ -296,7 +310,7 @@ def screen_stock(code, name, stock_info, df) -> dict | None:
         if ma30_slope < MA30_SLOPE_MIN:
             return None
 
-    # ── 第6层：量能确认 ──
+    # 第6层：量能确认
     df_ext["vol_ma5"] = ma(df_ext["volume"], 5)
     vol_ma5 = df_ext["vol_ma5"].dropna()
     if vol_ma5.empty:
@@ -309,34 +323,25 @@ def screen_stock(code, name, stock_info, df) -> dict | None:
     if vol_ratio < VOLUME_RATIO_MIN:
         return None
 
-    # ═══════════════════════════════════════════════════════
     # 计算价格和评分
-    # ═══════════════════════════════════════════════════════
     buy_price = round(close * (1 - BUY_OFFSET_PCT), 2)
     sell_price = round(buy_price * (1 + TARGET_RETURN), 2)
     stop_price = round(buy_price * (1 - STOP_LOSS_PCT), 2)
 
-    # 综合评分（满分100）
     score = 0.0
+    score += min(ret_5d * 30 / 0.05, 15)
+    score += min(ret_20d * 15 / 0.10, 15)
 
-    # 动量分 (30分)
-    score += min(ret_5d * 30 / 0.05, 15)       # 5日涨幅，满分15
-    score += min(ret_20d * 15 / 0.10, 15)       # 20日涨幅，满分15
-
-    # 波动率适配分 (20分)
-    # ATR在1.5%-2.5%之间最佳
     if 0.015 <= atr_pct <= 0.025:
         score += 20
     elif 0.01 <= atr_pct < 0.015 or 0.025 < atr_pct <= 0.03:
         score += 10
 
-    # 趋势分 (20分)
-    score += max(0, (1 - dist_ma20) * 10)       # 越接近MA20越好
+    score += max(0, (1 - dist_ma20) * 10)
     if last_ma30.notna().all() and len(ma30_series) >= 10:
         slope_score = min(ma30_slope * 10 / 0.05, 10)
         score += slope_score
 
-    # 量能分 (15分)
     if vol_ratio > 1.5:
         score += 15
     elif vol_ratio > 1.2:
@@ -344,13 +349,10 @@ def screen_stock(code, name, stock_info, df) -> dict | None:
     elif vol_ratio > 1.0:
         score += 5
 
-    # 稳定性分 (15分)
-    # 近5日没有大跌
     down_days = sum(1 for _, r in tail5.iterrows()
                     if float(r.get("p_change", 0)) < -2)
     score += max(0, 15 - down_days * 5)
 
-    # 阳线加分（当天收阳更好）
     if close > open_price:
         score += 3
 
@@ -397,14 +399,12 @@ def main():
     print(f"╚══════════════════════════════════════════════════════╝")
 
     try:
-        # 1. 获取股票列表
         print(f"\n[1/3] 获取A股列表...")
         all_stocks = get_all_stocks()
         if not all_stocks:
             print("[-] 无法获取股票列表，退出")
             sys.exit(1)
 
-        # 2. 逐只筛选
         print(f"\n[2/3] 筛选股票（共 {len(all_stocks)} 只）...")
         results = []
         errors = 0
@@ -439,7 +439,6 @@ def main():
 
             time.sleep(0.1)
 
-        # 3. 排序输出
         print(f"\n[3/3] 整理结果...")
         results.sort(key=lambda x: x["score"], reverse=True)
         final_stocks = results[:MAX_RESULTS]
