@@ -16,12 +16,13 @@ import akshare as ak
 import numpy as np
 import pandas as pd
 
-# ── 配置 ──
+# ── 配置 ──────────────────────────────────────────────────
 ENABLED_STRATEGIES = [
-    "海龟交易法则",
-    "放量上涨",
-    "均线多头",
+    "海龟交易法则",    # 20日新高突破 + 成交额过亿
+    "放量上涨",        # MA5金叉MA20 + 量比>2 + 涨幅>2%
+    "均线多头",        # MA30持续向上
 ]
+
 MIN_MARKET_CAP = 20e9
 MIN_AMOUNT = 2e8
 TOP_N = 20
@@ -30,6 +31,7 @@ RETRY_DELAY = 2
 BALANCE = 200000
 
 
+# ── 工具函数 ──────────────────────────────────────────────
 def ma(series, period):
     return series.rolling(window=period, min_periods=period).mean()
 
@@ -45,43 +47,96 @@ def retry(func, *args, **kwargs):
     for attempt in range(1, MAX_RETRIES + 1):
         try:
             return func(*args, **kwargs)
-        except Exception:
+        except Exception as e:
             if attempt < MAX_RETRIES:
                 time.sleep(RETRY_DELAY)
             else:
-                raise
+                raise e
 
 
+# ── 数据获取（双接口 + 重试） ─────────────────────────────
 def get_all_stocks():
-    try:
-        df = ak.stock_zh_a_spot_em()
-        stocks = []
-        for _, row in df.iterrows():
-            code = str(row["代码"]).zfill(6)
-            name = str(row["名称"])
-            nmc = float(row["流通市值"]) * 1e4 if pd.notna(row["流通市值"]) else 0
-            if nmc >= MIN_MARKET_CAP:
-                stocks.append({"code": code, "name": name, "nmc": nmc})
-        print(f"  [*] 获取到 {len(stocks)} 只股票（流通市值 >= {MIN_MARKET_CAP/1e9:.0f}亿）")
-        return stocks
-    except Exception as e:
-        print(f"  [!] 获取股票列表失败: {e}")
-        return []
+    fetchers = [_fetch_from_spot_em, _fetch_from_push2]
+    last_err = None
+    for fetcher in fetchers:
+        for attempt in range(1, MAX_RETRIES + 2):
+            try:
+                stocks = fetcher()
+                if stocks:
+                    return stocks
+            except Exception as e:
+                last_err = e
+                wait = RETRY_DELAY * attempt
+                print(f"  [!] {fetcher.__name__} 失败 (第{attempt}次): {e}")
+                if attempt < MAX_RETRIES + 1:
+                    print(f"  [*] 等待 {wait}s 后重试...")
+                    time.sleep(wait)
+    print(f"  [!] 所有接口均失败，最后错误: {last_err}")
+    return []
+
+
+def _fetch_from_spot_em():
+    """方式1: 东方财富实时行情接口"""
+    df = ak.stock_zh_a_spot_em()
+    stocks = []
+    for _, row in df.iterrows():
+        code = str(row["代码"]).zfill(6)
+        name = str(row["名称"])
+        nmc = float(row["流通市值"]) * 1e4 if pd.notna(row["流通市值"]) else 0
+        if nmc >= MIN_MARKET_CAP:
+            stocks.append({"code": code, "name": name, "nmc": nmc})
+    print(f"  [*] [spot_em] 获取到 {len(stocks)} 只股票（流通市值 >= {MIN_MARKET_CAP/1e9:.0f}亿）")
+    return stocks
+
+
+def _fetch_from_push2():
+    """方式2: 东方财富 push2 轻量接口"""
+    import requests
+    url = "https://push2.eastmoney.com/api/qt/clist/get"
+    params = {
+        "pn": "1", "pz": "5000", "po": "1", "np": "1",
+        "fltt": "2", "invt": "2", "fid": "f3",
+        "fs": "m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23",
+        "fields": "f12,f14,f20",
+    }
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Referer": "https://quote.eastmoney.com/",
+    }
+    resp = requests.get(url, params=params, headers=headers, timeout=30)
+    data = resp.json()
+    stocks = []
+    for item in data.get("data", {}).get("diff", []):
+        code = str(item.get("f12", "")).zfill(6)
+        name = str(item.get("f14", ""))
+        if not code or not name:
+            continue
+        nmc = float(item.get("f20", 0)) if item.get("f20") else 0
+        if nmc > 0:
+            nmc = nmc * 1e4
+        stocks.append({"code": code, "name": name, "nmc": nmc})
+    print(f"  [*] [push2] 获取到 {len(stocks)} 只股票（轻量接口）")
+    return stocks
 
 
 def get_stock_hist(code, days=300):
-    try:
-        start = (date.today() - timedelta(days=int(days * 1.5))).strftime("%Y%m%d")
-        end = date.today().strftime("%Y%m%d")
-        df = ak.stock_zh_a_hist(symbol=code, period="daily", start_date=start, end_date=end, adjust="qfq")
-        if df is None or df.empty:
-            return pd.DataFrame()
-        df.columns = ["date","open","close","high","low","volume","amount","amplitude","p_change","change_pct","turnover"]
-        return df
-    except Exception:
-        return pd.DataFrame()
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            start = (date.today() - timedelta(days=int(days * 1.5))).strftime("%Y%m%d")
+            end = date.today().strftime("%Y%m%d")
+            df = ak.stock_zh_a_hist(symbol=code, period="daily", start_date=start, end_date=end, adjust="qfq")
+            if df is None or df.empty:
+                return pd.DataFrame()
+            df.columns = ["date","open","close","high","low","volume","amount","amplitude","p_change","change_pct","turnover"]
+            return df
+        except Exception:
+            if attempt < MAX_RETRIES:
+                time.sleep(RETRY_DELAY * attempt)
+            else:
+                return pd.DataFrame()
 
 
+# ── 策略实现 ─────────────────────────────────────────────
 def strategy_turtle_trade(code, name, df):
     if len(df) < 60: return None
     window = df.tail(20)
@@ -101,8 +156,7 @@ def strategy_turtle_trade(code, name, df):
     hold_days = max(1, min(int(round(2 * current_atr / (current_atr * 1.5))), 15))
     return {"code": code, "name": name, "strategy": "海龟交易法则",
             "buy_price": buy_price, "sell_price": sell_price, "stop_price": stop_price,
-            "hold_days": hold_days, "atr": round(current_atr, 2),
-            "position_size": position_size,
+            "hold_days": hold_days, "atr": round(current_atr, 2), "position_size": position_size,
             "detail": f"ATR={current_atr:.2f}, 头寸={position_size}手, 止损={stop_price}"}
 
 
@@ -154,24 +208,28 @@ def strategy_ma_alignment(code, name, df):
             "detail": f"MA30={s_end:.2f}, 趋势={round(s_end/s1, 2)}x"}
 
 
+# ── 主流程 ────────────────────────────────────────────────
 def main():
     parser = argparse.ArgumentParser(description="A 股每日选股（集成 Sequoia 策略）")
-    parser.add_argument("--date", type=str, default=None, help="日期 YYYY-MM-DD")
+    parser.add_argument("--date", type=str, default=None, help="日期 YYYY-MM-DD，默认今天")
     args = parser.parse_args()
     target_date = args.date if args.date else date.today().isoformat()
     print(f"[*] 开始运行选股策略，目标日期: {target_date}")
     print(f"[*] 启用策略: {ENABLED_STRATEGIES}")
+
     try:
         print("\n[1/3] 获取 A 股列表...")
         all_stocks = get_all_stocks()
         if not all_stocks:
             print("[-] 无法获取股票列表，退出")
             sys.exit(1)
+
         print(f"\n[2/3] 运行策略扫描（共 {len(all_stocks)} 只股票）...")
         strategy_map = {"海龟交易法则": strategy_turtle_trade, "放量上涨": strategy_volume_breakout, "均线多头": strategy_ma_alignment}
         all_results = []
         errors = 0
         checked = 0
+
         for i, stock in enumerate(all_stocks):
             checked += 1
             if checked % 500 == 0:
@@ -183,39 +241,47 @@ def main():
                     df = get_stock_hist(code)
                     break
                 except Exception:
-                    if attempt < MAX_RETRIES: time.sleep(RETRY_DELAY)
-            if df.empty or len(df) < 30: continue
-            for sname in ENABLED_STRATEGIES:
-                if sname not in strategy_map: continue
+                    if attempt < MAX_RETRIES:
+                        time.sleep(RETRY_DELAY)
+            if df.empty or len(df) < 30:
+                continue
+            for strategy_name in ENABLED_STRATEGIES:
+                if strategy_name not in strategy_map: continue
                 try:
-                    result = strategy_map[sname](code, name, df)
+                    result = strategy_map[strategy_name](code, name, df)
                     if result: all_results.append(result)
                 except Exception: errors += 1
             time.sleep(0.1)
+
         print(f"\n[3/3] 整理结果...")
         final_stocks = []
         for sname in ENABLED_STRATEGIES:
             matched = [r for r in all_results if r["strategy"] == sname][:TOP_N]
             final_stocks.extend(matched)
-        seen, unique = set(), []
+        seen, unique_stocks = set(), []
         for s in final_stocks:
             if s["code"] not in seen:
                 seen.add(s["code"])
-                unique.append(s)
-        results = {"date": target_date, "strategies": ENABLED_STRATEGIES, "stock_count": len(unique), "stocks": unique}
+                unique_stocks.append(s)
+
+        results = {"date": target_date, "strategies": ENABLED_STRATEGIES, "stock_count": len(unique_stocks), "stocks": unique_stocks}
         os.makedirs("results", exist_ok=True)
         output_path = f"results/{target_date}.json"
         with open(output_path, "w", encoding="utf-8") as f:
             json.dump(results, f, ensure_ascii=False, indent=2)
+
         print(f"\n[+] 结果已保存到 {output_path}")
-        print(f"[+] 扫描 {checked} 只，错误 {errors} 次，选中 {len(unique)} 只（{len(all_results)} 次命中）")
-        for s in unique:
+        print(f"[+] 扫描 {checked} 只股票，错误 {errors} 次")
+        print(f"[+] 选中 {len(unique_stocks)} 只股票（{len(all_results)} 次策略命中）")
+        for s in unique_stocks:
             print(f"  {s['code']} {s['name']} [{s['strategy']}] 买入:{s.get('buy_price','N/A')} 卖出:{s.get('sell_price','N/A')} 持有:{s.get('hold_days','N/A')}天  {s.get('detail','')}")
         sys.exit(0)
+
     except Exception as e:
         print(f"[-] 运行失败: {e}")
         import traceback; traceback.print_exc()
         sys.exit(1)
+
 
 if __name__ == "__main__":
     main()
