@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-A 股每日选股脚本 — 5日5%策略模型
+A 股每日选股脚本 — 5日5%策略模型（v2 带诊断日志）
 专为挂单操作模式设计：
   - 买入价 = 收盘价 - 0.5%（低吸挂单）
   - 卖出价 = 买入价 + 5%（目标止盈）
@@ -8,6 +8,12 @@ A 股每日选股脚本 — 5日5%策略模型
   - 持有期 = 5个交易日
   - 盈亏比 = 2.5（每次盈利5%，每次止损亏2%）
 数据源：akshare（免费）
+
+v2 改进：
+  - 每层筛选输出失败原因和关键数值
+  - 主流程统计各层淘汰分布
+  - 支持 --verbose 逐只输出详细日志
+  - 支持 --sample N 只扫描前N只（调试加速）
 """
 import argparse
 import json
@@ -217,11 +223,17 @@ def get_stock_hist(code, days=300):
 
 
 # ═══════════════════════════════════════════════════════════
-# 核心筛选逻辑 — 5日5%策略
+# 核心筛选逻辑 — 5日5%策略（v2 带诊断日志）
 # ═══════════════════════════════════════════════════════════
-def screen_stock(code, name, stock_info, df) -> dict | None:
+def screen_stock(code, name, stock_info, df, verbose=False):
+    """
+    对单只股票进行 6 层筛选。
+    返回 (result_dict_or_None, fail_layer_or_None)
+    """
     if len(df) < 40:
-        return None
+        if verbose:
+            print(f"  [L0-数据不足] {code} {name} 历史数据仅{len(df)}条 < 40")
+        return None, "L0-数据不足"
 
     last = df.iloc[-1]
     close = float(last["close"])
@@ -230,15 +242,19 @@ def screen_stock(code, name, stock_info, df) -> dict | None:
     low = float(last["low"])
     amount = float(last["amount"])
 
-    # 第1层：基础检查
+    # ── 第1层：基础检查 ──
     if amount < MIN_AMOUNT:
-        return None
+        if verbose:
+            print(f"  [L1-成交额] {code} {name} 成交额={amount/1e8:.2f}亿 < {MIN_AMOUNT/1e8:.1f}亿")
+        return None, "L1-成交额不足"
 
     today_change = float(last.get("p_change", 0)) if pd.notna(last.get("p_change", 0)) else 0
     if abs(today_change) > MAX_DAILY_CHANGE * 100:
-        return None
+        if verbose:
+            print(f"  [L1-涨跌幅] {code} {name} 涨跌幅={today_change:.2f}% 超出±{MAX_DAILY_CHANGE*100:.0f}%")
+        return None, "L1-涨跌幅过大"
 
-    # 第2层：排除规则
+    # ── 第2层：排除规则 ──
     tail5 = df.tail(5)
 
     consecutive_drop = 0
@@ -249,79 +265,113 @@ def screen_stock(code, name, stock_info, df) -> dict | None:
         else:
             break
     if consecutive_drop > MAX_CONSECUTIVE_DROP:
-        return None
+        if verbose:
+            print(f"  [L2-连续跌] {code} {name} 连续跌{consecutive_drop}天 > {MAX_CONSECUTIVE_DROP}天")
+        return None, "L2-连续下跌"
 
     if DOWNTICK_IN_5D:
         for _, row in tail5.iterrows():
             chg = float(row.get("p_change", 0)) if pd.notna(row.get("p_change", 0)) else 0
             if chg < -9.5:
-                return None
+                if verbose:
+                    print(f"  [L2-跌停] {code} {name} 近5日有跌停（涨幅={chg:.2f}%）")
+                return None, "L2-近5日跌停"
 
     recent = df.tail(10)
     for _, row in recent.iterrows():
         h = float(row["high"])
         l = float(row["low"])
         if l > 0 and (h - l) / l > MIN_HIGH_LOW_SPREAD:
-            return None
+            if verbose:
+                print(f"  [L2-振幅] {code} {name} 近10日单日振幅>{MIN_HIGH_LOW_SPREAD*100:.0f}%")
+            return None, "L2-振幅过大"
 
-    # 第3层：动量确认
+    # ── 第3层：动量确认 ──
     ret_5d = pct_change_from_period(df, "close", 5)
     ret_20d = pct_change_from_period(df, "close", 20)
 
     if ret_5d < MIN_5D_RETURN:
-        return None
+        if verbose:
+            print(f"  [L3-动量] {code} {name} 5日涨幅={ret_5d*100:.2f}% < {MIN_5D_RETURN*100:.0f}%")
+        return None, "L3-5日涨幅不足"
     if ret_20d < MIN_20D_RETURN:
-        return None
+        if verbose:
+            print(f"  [L3-动量] {code} {name} 20日涨幅={ret_20d*100:.2f}% < {MIN_20D_RETURN*100:.0f}%")
+        return None, "L3-20日涨幅不足"
 
-    # 第4层：波动率适配
+    # ── 第4层：波动率适配 ──
     atr_series = compute_atr(df["high"], df["low"], df["close"], 5)
     if atr_series.empty:
-        return None
+        if verbose:
+            print(f"  [L4-ATR] {code} {name} ATR序列为空")
+        return None, "L4-ATR数据不足"
     atr_5d = float(atr_series.iloc[-1])
     if atr_5d <= 0:
-        return None
+        if verbose:
+            print(f"  [L4-ATR] {code} {name} ATR={atr_5d} <= 0")
+        return None, "L4-ATR无效"
     atr_pct = atr_5d / close
 
     if atr_pct < ATR_PCT_MIN or atr_pct > ATR_PCT_MAX:
-        return None
+        if verbose:
+            print(f"  [L4-ATR] {code} {name} ATR%={atr_pct*100:.2f}% 不在[{ATR_PCT_MIN*100:.0f}%,{ATR_PCT_MAX*100:.0f}%]")
+        return None, "L4-ATR区间不符"
 
-    # 第5层：趋势+支撑
+    # ── 第5层：趋势+支撑 ──
     df_ext = df.copy()
     df_ext["ma20"] = ma(df_ext["close"], 20)
     df_ext["ma30"] = ma(df_ext["close"], 30)
 
     last_ma20 = df_ext["ma20"].dropna()
     if last_ma20.empty:
-        return None
+        if verbose:
+            print(f"  [L5-趋势] {code} {name} MA20数据不足")
+        return None, "L5-MA20数据不足"
     current_ma20 = float(last_ma20.iloc[-1])
 
     dist_ma20 = abs(close - current_ma20) / current_ma20
     if dist_ma20 > MAX_DIST_MA20 or close < current_ma20:
-        return None
+        if verbose:
+            print(f"  [L5-趋势] {code} {name} 距MA20={dist_ma20*100:.2f}% > {MAX_DIST_MA20*100:.0f}% 或 收盘价<{current_ma20:.2f} < MA20")
+        return None, "L5-未站上MA20"
 
     last_ma30 = df_ext["ma30"].dropna()
     if last_ma30.empty:
-        return None
+        if verbose:
+            print(f"  [L5-趋势] {code} {name} MA30数据不足")
+        return None, "L5-MA30数据不足"
     ma30_series = last_ma30.tail(10)
     if len(ma30_series) >= 10:
         ma30_start = float(ma30_series.iloc[0])
         ma30_end = float(ma30_series.iloc[-1])
         ma30_slope = (ma30_end - ma30_start) / ma30_start
         if ma30_slope < MA30_SLOPE_MIN:
-            return None
+            if verbose:
+                print(f"  [L5-趋势] {code} {name} MA30斜率={ma30_slope*100:.4f}% < {MA30_SLOPE_MIN*100:.0f}%")
+            return None, "L5-MA30斜率不足"
 
-    # 第6层：量能确认
+    # ── 第6层：量能确认 ──
     df_ext["vol_ma5"] = ma(df_ext["volume"], 5)
     vol_ma5 = df_ext["vol_ma5"].dropna()
     if vol_ma5.empty:
-        return None
+        if verbose:
+            print(f"  [L6-量能] {code} {name} 5日均量数据不足")
+        return None, "L6-量能数据不足"
     current_vol_ma5 = float(vol_ma5.iloc[-1])
     if current_vol_ma5 <= 0:
-        return None
+        if verbose:
+            print(f"  [L6-量能] {code} {name} 5日均量={current_vol_ma5} <= 0")
+        return None, "L6-量能无效"
 
     vol_ratio = float(last["volume"]) / current_vol_ma5
     if vol_ratio < VOLUME_RATIO_MIN:
-        return None
+        if verbose:
+            print(f"  [L6-量能] {code} {name} 量比={vol_ratio:.2f} < {VOLUME_RATIO_MIN}")
+        return None, "L6-量比不足"
+
+    # ── 全部通过 ──
+    if verbose:
+        print(f"  [PASS] {code} {name} 6层全通过 | 5日涨={ret_5d*100:.2f}% 20日涨={ret_20d*100:.2f}% ATR%={atr_pct*100:.2f}% 量比={vol_ratio:.2f} 距MA20={dist_ma20*100:.2f}%")
 
     # 计算价格和评分
     buy_price = round(close * (1 - BUY_OFFSET_PCT), 2)
@@ -358,7 +408,7 @@ def screen_stock(code, name, stock_info, df) -> dict | None:
 
     score = round(score, 1)
 
-    return {
+    result = {
         "code": code,
         "name": name,
         "buy_price": buy_price,
@@ -380,6 +430,7 @@ def screen_stock(code, name, stock_info, df) -> dict | None:
             f"距MA20 {dist_ma20*100:.1f}%"
         ),
     }
+    return result, None
 
 
 # ═══════════════════════════════════════════════════════════
@@ -388,15 +439,23 @@ def screen_stock(code, name, stock_info, df) -> dict | None:
 def main():
     parser = argparse.ArgumentParser(description="A 股每日选股 — 5日5%策略")
     parser.add_argument("--date", type=str, default=None, help="日期 YYYY-MM-DD，默认今天")
+    parser.add_argument("--verbose", action="store_true", help="逐只输出筛选日志（调试用）")
+    parser.add_argument("--sample", type=int, default=0, help="只扫描前N只股票（调试用，0=全部）")
     args = parser.parse_args()
     target_date = args.date if args.date else date.today().isoformat()
+    verbose = args.verbose
+    sample_n = args.sample
 
     print(f"╔══════════════════════════════════════════════════════╗")
-    print(f"║  A股每日选股 — 5日5%策略                              ║")
+    print(f"║  A股每日选股 — 5日5%策略 v2（带诊断日志）              ║")
     print(f"║  目标日期: {target_date}                                ║")
     print(f"║  买入价=收盘价-0.5% | 卖出价=买入价+5% | 止损=买入价-2% ║")
     print(f"║  持有期=5交易日 | 盈亏比=2.5                         ║")
     print(f"╚══════════════════════════════════════════════════════╝")
+    if verbose:
+        print("[*] 详细日志模式: ON")
+    if sample_n > 0:
+        print(f"[*] 采样模式: 只扫描前 {sample_n} 只")
 
     try:
         print(f"\n[1/3] 获取A股列表...")
@@ -405,15 +464,19 @@ def main():
             print("[-] 无法获取股票列表，退出")
             sys.exit(1)
 
-        print(f"\n[2/3] 筛选股票（共 {len(all_stocks)} 只）...")
+        # 采样模式：只扫前 N 只（调试用）
+        work_list = all_stocks[:sample_n] if sample_n > 0 else all_stocks
+
+        print(f"\n[2/3] 筛选股票（共 {len(all_stocks)} 只，本次扫描 {len(work_list)} 只）...")
         results = []
         errors = 0
         checked = 0
+        fail_stats = {}  # 统计各层失败次数
 
-        for i, stock in enumerate(all_stocks):
+        for i, stock in enumerate(work_list):
             checked += 1
-            if checked % 200 == 0:
-                print(f"  ... 已扫描 {checked}/{len(all_stocks)}，通过 {len(results)} 只")
+            if not verbose and checked % 200 == 0:
+                print(f"  ... 已扫描 {checked}/{len(work_list)}，通过 {len(results)} 只")
 
             code = stock["code"]
             name = stock["name"]
@@ -428,16 +491,35 @@ def main():
                         time.sleep(RETRY_DELAY)
 
             if df.empty or len(df) < 40:
+                fail_stats["L0-数据不足"] = fail_stats.get("L0-数据不足", 0) + 1
+                if verbose:
+                    print(f"  [L0-数据不足] {code} {name} 历史数据不足40条")
                 continue
 
             try:
-                result = screen_stock(code, name, stock, df)
+                result, fail_layer = screen_stock(code, name, stock, df, verbose=verbose)
                 if result:
                     results.append(result)
+                else:
+                    fail_stats[fail_layer] = fail_stats.get(fail_layer, 0) + 1
             except Exception as e:
                 errors += 1
+                print(f"  [!] {code} {name} 异常: {e}")
 
-            time.sleep(0.1)
+            if not verbose:
+                time.sleep(0.1)
+
+        # ── 输出各层过滤统计 ──
+        print(f"\n{'='*60}")
+        print(f"  各层过滤统计（共扫描 {checked} 只，通过 {len(results)} 只）")
+        print(f"{'='*60}")
+        if fail_stats:
+            for layer, cnt in sorted(fail_stats.items(), key=lambda x: -x[1]):
+                pct = cnt / checked * 100 if checked > 0 else 0
+                print(f"  {layer:<25} 淘汰 {cnt:>5} 只 ({pct:>5.1f}%)")
+        else:
+            print("  （全部通过或采样为0）")
+        print(f"{'='*60}")
 
         print(f"\n[3/3] 整理结果...")
         results.sort(key=lambda x: x["score"], reverse=True)
@@ -452,6 +534,7 @@ def main():
             ),
             "stock_count": len(final_stocks),
             "stocks": final_stocks,
+            "filter_stats": {k: v for k, v in sorted(fail_stats.items(), key=lambda x: -x[1])},
         }
 
         os.makedirs("results", exist_ok=True)
