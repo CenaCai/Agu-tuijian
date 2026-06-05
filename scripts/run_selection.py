@@ -163,6 +163,9 @@ def _fetch_from_push2():
         name = str(item.get("f14", ""))
         if not code or not name:
             continue
+        # 排除科创板（688/689）和北交所（83x/87x），它们的 K 线数据经常不足 40 条
+        if code.startswith("688") or code.startswith("689") or code.startswith("83") or code.startswith("87"):
+            continue
         close_price = item.get("f2", 0) or 0
         p_change = item.get("f3", 0) or 0
         high = item.get("f15", 0) or 0
@@ -176,7 +179,7 @@ def _fetch_from_push2():
                 "code": code, "name": name, "nmc": nmc,
                 "close": close_price, "amount": amount, "p_change": p_change / 100,
             })
-    print(f"  [*] [push2] 获取到 {len(stocks)} 只股票（轻量接口）")
+    print(f"  [*] [push2] 获取到 {len(stocks)} 只股票（已过滤科创板/北交所）")
     return stocks
 
 
