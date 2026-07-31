@@ -1,577 +1,311 @@
-#!/usr/bin/env python3
-"""
-A 股每日选股脚本 — 5日5%策略模型（v2 带诊断日志）
-专为挂单操作模式设计：
-  - 买入价 = 收盘价 - 0.5%（低吸挂单）
-  - 卖出价 = 买入价 + 5%（目标止盈）
-  - 止损价 = 买入价 - 2%（止损线）
-  - 持有期 = 5个交易日
-  - 盈亏比 = 2.5（每次盈利5%，每次止损亏2%）
-数据源：akshare（免费）
-
-v2 改进：
-  - 每层筛选输出失败原因和关键数值
-  - 主流程统计各层淘汰分布
-  - 支持 --verbose 逐只输出详细日志
-  - 支持 --sample N 只扫描前N只（调试加速）
-"""
-import argparse
-import json
-import math
 import os
 import sys
-import time
-from datetime import date, timedelta
-
-import akshare as ak
-import numpy as np
+import json
 import pandas as pd
+import numpy as np
+from datetime import datetime, timedelta
+import akshare as ak
+import warnings
+warnings.filterwarnings('ignore')
 
-# ═══════════════════════════════════════════════════════════
-# 配置参数
-# ═══════════════════════════════════════════════════════════
+# ==================== 配置参数（可调） ====================
+TARGET_RETURN = 0.05      # 目标收益率 5%
+STOP_LOSS_PCT = 0.02     # 止损线 2%
+HOLD_DAYS = 5            # 持有天数
+MIN_MARKET_CAP = 50      # 最小市值（亿）
+MIN_VOLUME = 5000        # 最小成交额（万元）
+MIN_PRICE = 3            # 最低价格
+MAX_PRICE = 100          # 最高价格
+MAX_CONSECUTIVE_DOWN = 3 # 最大连续下跌天数
+MAX_AMPLITUDE = 0.08     # 最大振幅 8%
+MAX_DAILY_CHANGE = 0.05  # 当日最大涨幅 5%
+MIN_CHANGE_5D = 0.0      # 5日最小涨幅 0%
+MIN_CHANGE_20D = 0.03    # 20日最小涨幅 3%
+MIN_ATR = 0.01           # 最小ATR比率 1%
+MAX_ATR = 0.05           # 最大ATR比率 5%（原3%放宽至5%）
+MAX_MA20_DEVIATION = 0.03 # MA20最大偏离 3%
 
-# 基础筛选
-MIN_MARKET_CAP = 5e9          # 最低流通市值 50亿（流动性保证）
-MIN_AMOUNT = 5000e4           # 最低日成交额 5000万
-MAX_PRICE = 100               # 排除高价股（>100元操作风险大）
-MIN_PRICE = 3                 # 排除低价垃圾股
+# ==================== 路径处理 ====================
+def get_project_root():
+    """获取项目根目录（无论从哪里执行）"""
+    return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-# 策略参数
-TARGET_RETURN = 0.05          # 目标收益 5%
-STOP_LOSS_PCT = 0.02          # 止损幅度 2%
-BUY_OFFSET_PCT = 0.005       # 买入价偏移（比收盘价低0.5%）
-HOLD_DAYS = 5                 # 持有周期（交易日）
+def ensure_results_dir():
+    """确保results目录存在"""
+    results_dir = os.path.join(get_project_root(), "results")
+    os.makedirs(results_dir, exist_ok=True)
+    return results_dir
 
-# 动量条件
-MIN_5D_RETURN = 0.0           # 5日涨幅 > 0%（至少不跌）
-MIN_20D_RETURN = 0.03         # 20日涨幅 > 3%（中期趋势向上）
-VOLUME_RATIO_MIN = 0.8        # 量比下限（不低于平均）
-MAX_DAILY_CHANGE = 0.05       # 排除当日涨幅>5%（追高风险）
-
-# 波动率适配
-ATR_PCT_MIN = 0.01            # 5日ATR/价格 > 1%（太低则5%难到）
-ATR_PCT_MAX = 0.03            # 5日ATR/价格 < 3%（太高则下跌风险大）
-
-# 趋势条件
-MAX_DIST_MA20 = 0.03          # 距MA20 < 3%（有支撑）
-MA30_SLOPE_MIN = 0.0           # MA30斜率 > 0（中期向上）
-
-# 排除条件
-MAX_CONSECUTIVE_DROP = 3      # 连续跌>3天排除
-MIN_HIGH_LOW_SPREAD = 0.08     # 单日振幅>8%排除
-DOWNTICK_IN_5D = True         # 近5日有跌停排除
-
-# 输出限制
-MAX_RESULTS = 10              # 最多推荐10只
-
-# 网络
-MAX_RETRIES = 3
-RETRY_DELAY = 2
-
-
-# ═══════════════════════════════════════════════════════════
-# 工具函数
-# ═══════════════════════════════════════════════════════════
-def ma(series, period):
-    return series.rolling(window=period, min_periods=period).mean()
-
-
-def compute_atr(high, low, close, period=5):
-    h = high.values
-    l = low.values
-    c = close.values
-    if len(c) < period + 1:
-        return pd.Series(dtype=float)
-    tr = []
-    for i in range(1, len(c)):
-        tr.append(max(h[i] - l[i], abs(h[i] - c[i-1]), abs(l[i] - c[i-1])))
-    tr = pd.Series(tr, index=high.index[1:])
-    return tr.rolling(window=period, min_periods=period).mean()
-
-
-def pct_change_from_period(df, col="close", period=5):
-    if len(df) < period + 1:
-        return 0.0
-    return (float(df[col].iloc[-1]) / float(df[col].iloc[-(period+1)])) - 1
-
-
-# ═══════════════════════════════════════════════════════════
-# 数据获取（三接口+重试机制）
-# ═══════════════════════════════════════════════════════════
-def get_all_stocks():
-    fetchers = [_fetch_from_spot_em, _fetch_from_push2, _fetch_from_ak_list]
-    last_err = None
-    for fetcher in fetchers:
-        for attempt in range(1, MAX_RETRIES + 2):
-            try:
-                stocks = fetcher()
-                if stocks:
-                    return stocks
-            except Exception as e:
-                last_err = e
-                wait = RETRY_DELAY * attempt
-                print(f"  [!] {fetcher.__name__} 失败 (第{attempt}次): {e}")
-                if attempt < MAX_RETRIES + 1:
-                    time.sleep(wait)
-    print(f"  [!] 所有接口均失败: {last_err}")
-    return []
-
-
-def _fetch_from_spot_em():
-    df = ak.stock_zh_a_spot_em()
-    stocks = []
-    for _, row in df.iterrows():
-        code = str(row["代码"]).zfill(6)
-        name = str(row["名称"])
-        nmc = float(row["流通市值"]) * 1e4 if pd.notna(row["流通市值"]) else 0
-        close_price = float(row["最新价"]) if pd.notna(row["最新价"]) else 0
-        amount = float(row["成交额"]) if pd.notna(row["成交额"]) else 0
-        p_change = float(row["涨跌幅"]) if pd.notna(row["涨跌幅"]) else 0
-        if nmc >= MIN_MARKET_CAP and close_price >= MIN_PRICE and close_price <= MAX_PRICE:
-            stocks.append({
-                "code": code, "name": name, "nmc": nmc,
-                "close": close_price, "amount": amount, "p_change": p_change,
-            })
-    print(f"  [*] [spot_em] 获取到 {len(stocks)} 只股票（市值>=50亿，价格3-100元）")
-    return stocks
-
-
-def _fetch_from_push2():
-    import requests
-    url = "https://push2.eastmoney.com/api/qt/clist/get"
-    params = {
-        "pn": "1", "pz": "5000", "po": "1", "np": "1",
-        "fltt": "2", "invt": "2", "fid": "f3",
-        "fs": "m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23",
-        "fields": "f2,f3,f6,f7,f12,f14,f15,f16,f17,f20",
-    }
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Referer": "https://quote.eastmoney.com/",
-        "Accept": "*/*",
-        "Accept-Encoding": "gzip, deflate",
-        "Connection": "keep-alive",
-    }
-    resp = requests.get(url, params=params, headers=headers, timeout=30)
-    if resp.status_code != 200 or not resp.text:
-        raise ValueError(f"push2 返回异常: HTTP {resp.status_code}, body={resp.text[:200]}")
-    data = resp.json()
-    stocks = []
-    for item in data.get("data", {}).get("diff", []):
-        code = str(item.get("f12", "")).zfill(6)
-        name = str(item.get("f14", ""))
-        if not code or not name:
-            continue
-        # 排除科创板（688/689）和北交所（83x/87x），它们的 K 线数据经常不足 40 条
-        if code.startswith("688") or code.startswith("689") or code.startswith("83") or code.startswith("87"):
-            continue
-        close_price = item.get("f2", 0) or 0
-        p_change = item.get("f3", 0) or 0
-        high = item.get("f15", 0) or 0
-        low = item.get("f16", 0) or 0
-        amount = item.get("f6", 0) or 0
-        nmc = item.get("f20", 0) or 0
-        if nmc > 0:
-            nmc = nmc * 1e4
-        if nmc >= MIN_MARKET_CAP and close_price >= MIN_PRICE and close_price <= MAX_PRICE:
-            stocks.append({
-                "code": code, "name": name, "nmc": nmc,
-                "close": close_price, "amount": amount, "p_change": p_change / 100,
-            })
-    print(f"  [*] [push2] 获取到 {len(stocks)} 只股票（已过滤科创板/北交所）")
-    return stocks
-
-
-def _fetch_from_ak_list():
+# ==================== 数据获取（增强容错） ====================
+def get_stock_list():
+    """获取股票列表，过滤科创板(688)、北交所(8/4开头)"""
     try:
-        df = ak.stock_info_a_code_name()
-    except Exception:
-        try:
-            df = ak.stock_zh_a_spot_em()
-        except Exception:
-            return []
-    stocks = []
-    if df is not None and not df.empty:
-        for _, row in df.iterrows():
-            code_col = "代码" if "代码" in df.columns else "code"
-            name_col = "名称" if "名称" in df.columns else "name"
-            code = str(row.get(code_col, "")).zfill(6)
-            name = str(row.get(name_col, ""))
-            if not code or not name:
-                continue
-            stocks.append({"code": code, "name": name, "nmc": 0, "close": 0, "amount": 0, "p_change": 0})
-    print(f"  [*] [ak_list] 获取到 {len(stocks)} 只股票（纯代码列表，市值筛选延后）")
-    return stocks
+        # 尝试获取A股列表
+        stock_info = ak.stock_info_a_code_name()
+        # 过滤：剔除科创板(688)、北交所(8/4开头)
+        stock_info = stock_info[~stock_info['code'].str.startswith(('688', '8', '4'))]
+        return stock_info['code'].tolist()
+    except Exception as e:
+        print(f"获取股票列表失败: {e}")
+        # 备用方案：使用本地缓存或手动指定沪深300等
+        return get_fallback_stock_list()
 
+def get_fallback_stock_list():
+    """备用股票列表（沪深300成分股）"""
+    try:
+        df = ak.index_stock_cons_csindex("000300")
+        return df['成分券代码'].tolist()
+    except:
+        print("备用列表也失败了，请检查网络")
+        sys.exit(1)
 
-def get_stock_hist(code, days=300):
-    for attempt in range(1, MAX_RETRIES + 1):
+def get_stock_data(code, start_date, end_date):
+    """获取单只股票历史数据，带重试"""
+    for attempt in range(3):
         try:
-            start = (date.today() - timedelta(days=int(days * 1.5))).strftime("%Y%m%d")
-            end = date.today().strftime("%Y%m%d")
             df = ak.stock_zh_a_hist(
-                symbol=code, period="daily",
-                start_date=start, end_date=end, adjust="qfq",
+                symbol=code,
+                period="daily",
+                start_date=start_date,
+                end_date=end_date,
+                adjust="qfq"  # 前复权
             )
-            if df is None or df.empty:
-                return pd.DataFrame()
-            df.columns = ["date", "open", "close", "high", "low", "volume", "amount", "amplitude", "p_change", "change_pct", "turnover"]
-            return df
+            if df is not None and not df.empty:
+                # 标准化列名
+                df.columns = ['日期', '开盘', '收盘', '最高', '最低', '成交量', '成交额', '振幅', 
+                              '涨跌幅', '涨跌额', '换手率']
+                return df
         except Exception as e:
-            if attempt < MAX_RETRIES:
-                time.sleep(RETRY_DELAY * attempt)
-            else:
-                return pd.DataFrame()
+            print(f"获取 {code} 数据失败 (尝试 {attempt+1}/3): {e}")
+            continue
+    return None
 
+# ==================== 核心选股逻辑 ====================
+def calculate_metrics(df):
+    """计算技术指标"""
+    if df is None or len(df) < 20:
+        return None
+    
+    df = df.copy()
+    
+    # 计算均线
+    df['MA20'] = df['收盘'].rolling(window=20).mean()
+    df['MA30'] = df['收盘'].rolling(window=30).mean()
+    
+    # 计算ATR (平均真实波幅)
+    df['TR'] = np.maximum(
+        df['最高'] - df['最低'],
+        np.maximum(
+            abs(df['最高'] - df['收盘'].shift()),
+            abs(df['最低'] - df['收盘'].shift())
+        )
+    )
+    df['ATR'] = df['TR'].rolling(window=5).mean()
+    
+    # 计算涨跌幅
+    df['change_5d'] = (df['收盘'] - df['收盘'].shift(5)) / df['收盘'].shift(5)
+    df['change_20d'] = (df['收盘'] - df['收盘'].shift(20)) / df['收盘'].shift(20)
+    
+    # 量比（5日均量/20日均量）
+    df['volume_ma5'] = df['成交量'].rolling(window=5).mean()
+    df['volume_ma20'] = df['成交量'].rolling(window=20).mean()
+    df['volume_ratio'] = df['volume_ma5'] / df['volume_ma20']
+    
+    return df
 
-# ═══════════════════════════════════════════════════════════
-# 核心筛选逻辑 — 5日5%策略（v2 带诊断日志）
-# ═══════════════════════════════════════════════════════════
-def screen_stock(code, name, stock_info, df, verbose=False):
-    """
-    对单只股票进行 6 层筛选。
-    返回 (result_dict_or_None, fail_layer_or_None)
-    """
-    if len(df) < 40:
-        if verbose:
-            print(f"  [L0-数据不足] {code} {name} 历史数据仅{len(df)}条 < 40")
-        return None, "L0-数据不足"
-
-    last = df.iloc[-1]
-    close = float(last["close"])
-    open_price = float(last["open"])
-    high = float(last["high"])
-    low = float(last["low"])
-    amount = float(last["amount"])
-
-    # ── 第1层：基础检查 ──
-    if amount < MIN_AMOUNT:
-        if verbose:
-            print(f"  [L1-成交额] {code} {name} 成交额={amount/1e8:.2f}亿 < {MIN_AMOUNT/1e8:.1f}亿")
-        return None, "L1-成交额不足"
-
-    today_change = float(last.get("p_change", 0)) if pd.notna(last.get("p_change", 0)) else 0
-    if abs(today_change) > MAX_DAILY_CHANGE * 100:
-        if verbose:
-            print(f"  [L1-涨跌幅] {code} {name} 涨跌幅={today_change:.2f}% 超出±{MAX_DAILY_CHANGE*100:.0f}%")
-        return None, "L1-涨跌幅过大"
-
-    # ── 第2层：排除规则 ──
-    tail5 = df.tail(5)
-
-    consecutive_drop = 0
-    for _, row in tail5.iterrows():
-        chg = float(row.get("p_change", 0)) if pd.notna(row.get("p_change", 0)) else 0
-        if chg < 0:
-            consecutive_drop += 1
+def check_criteria(df, idx):
+    """检查单日是否符合所有筛选条件"""
+    if idx < 20:
+        return False, {}
+    
+    row = df.iloc[idx]
+    prev_row = df.iloc[idx-1] if idx > 0 else row
+    
+    # 1. 基础筛选（价格、成交额）
+    if not (MIN_PRICE <= row['收盘'] <= MAX_PRICE):
+        return False, {}
+    if row['成交额'] < MIN_VOLUME * 10000:  # 转为元
+        return False, {}
+    
+    # 2. 排除规则
+    # 连续下跌
+    down_days = 0
+    for i in range(idx-1, max(idx-5, -1), -1):
+        if df.iloc[i]['涨跌幅'] < 0:
+            down_days += 1
         else:
             break
-    if consecutive_drop > MAX_CONSECUTIVE_DROP:
-        if verbose:
-            print(f"  [L2-连续跌] {code} {name} 连续跌{consecutive_drop}天 > {MAX_CONSECUTIVE_DROP}天")
-        return None, "L2-连续下跌"
-
-    if DOWNTICK_IN_5D:
-        for _, row in tail5.iterrows():
-            chg = float(row.get("p_change", 0)) if pd.notna(row.get("p_change", 0)) else 0
-            if chg < -9.5:
-                if verbose:
-                    print(f"  [L2-跌停] {code} {name} 近5日有跌停（涨幅={chg:.2f}%）")
-                return None, "L2-近5日跌停"
-
-    recent = df.tail(10)
-    for _, row in recent.iterrows():
-        h = float(row["high"])
-        l = float(row["low"])
-        if l > 0 and (h - l) / l > MIN_HIGH_LOW_SPREAD:
-            if verbose:
-                print(f"  [L2-振幅] {code} {name} 近10日单日振幅>{MIN_HIGH_LOW_SPREAD*100:.0f}%")
-            return None, "L2-振幅过大"
-
-    # ── 第3层：动量确认 ──
-    ret_5d = pct_change_from_period(df, "close", 5)
-    ret_20d = pct_change_from_period(df, "close", 20)
-
-    if ret_5d < MIN_5D_RETURN:
-        if verbose:
-            print(f"  [L3-动量] {code} {name} 5日涨幅={ret_5d*100:.2f}% < {MIN_5D_RETURN*100:.0f}%")
-        return None, "L3-5日涨幅不足"
-    if ret_20d < MIN_20D_RETURN:
-        if verbose:
-            print(f"  [L3-动量] {code} {name} 20日涨幅={ret_20d*100:.2f}% < {MIN_20D_RETURN*100:.0f}%")
-        return None, "L3-20日涨幅不足"
-
-    # ── 第4层：波动率适配 ──
-    atr_series = compute_atr(df["high"], df["low"], df["close"], 5)
-    if atr_series.empty:
-        if verbose:
-            print(f"  [L4-ATR] {code} {name} ATR序列为空")
-        return None, "L4-ATR数据不足"
-    atr_5d = float(atr_series.iloc[-1])
-    if atr_5d <= 0:
-        if verbose:
-            print(f"  [L4-ATR] {code} {name} ATR={atr_5d} <= 0")
-        return None, "L4-ATR无效"
-    atr_pct = atr_5d / close
-
-    if atr_pct < ATR_PCT_MIN or atr_pct > ATR_PCT_MAX:
-        if verbose:
-            print(f"  [L4-ATR] {code} {name} ATR%={atr_pct*100:.2f}% 不在[{ATR_PCT_MIN*100:.0f}%,{ATR_PCT_MAX*100:.0f}%]")
-        return None, "L4-ATR区间不符"
-
-    # ── 第5层：趋势+支撑 ──
-    df_ext = df.copy()
-    df_ext["ma20"] = ma(df_ext["close"], 20)
-    df_ext["ma30"] = ma(df_ext["close"], 30)
-
-    last_ma20 = df_ext["ma20"].dropna()
-    if last_ma20.empty:
-        if verbose:
-            print(f"  [L5-趋势] {code} {name} MA20数据不足")
-        return None, "L5-MA20数据不足"
-    current_ma20 = float(last_ma20.iloc[-1])
-
-    dist_ma20 = abs(close - current_ma20) / current_ma20
-    if dist_ma20 > MAX_DIST_MA20 or close < current_ma20:
-        if verbose:
-            print(f"  [L5-趋势] {code} {name} 距MA20={dist_ma20*100:.2f}% > {MAX_DIST_MA20*100:.0f}% 或 收盘价<{current_ma20:.2f} < MA20")
-        return None, "L5-未站上MA20"
-
-    last_ma30 = df_ext["ma30"].dropna()
-    if last_ma30.empty:
-        if verbose:
-            print(f"  [L5-趋势] {code} {name} MA30数据不足")
-        return None, "L5-MA30数据不足"
-    ma30_series = last_ma30.tail(10)
-    if len(ma30_series) >= 10:
-        ma30_start = float(ma30_series.iloc[0])
-        ma30_end = float(ma30_series.iloc[-1])
-        ma30_slope = (ma30_end - ma30_start) / ma30_start
-        if ma30_slope < MA30_SLOPE_MIN:
-            if verbose:
-                print(f"  [L5-趋势] {code} {name} MA30斜率={ma30_slope*100:.4f}% < {MA30_SLOPE_MIN*100:.0f}%")
-            return None, "L5-MA30斜率不足"
-
-    # ── 第6层：量能确认 ──
-    df_ext["vol_ma5"] = ma(df_ext["volume"], 5)
-    vol_ma5 = df_ext["vol_ma5"].dropna()
-    if vol_ma5.empty:
-        if verbose:
-            print(f"  [L6-量能] {code} {name} 5日均量数据不足")
-        return None, "L6-量能数据不足"
-    current_vol_ma5 = float(vol_ma5.iloc[-1])
-    if current_vol_ma5 <= 0:
-        if verbose:
-            print(f"  [L6-量能] {code} {name} 5日均量={current_vol_ma5} <= 0")
-        return None, "L6-量能无效"
-
-    vol_ratio = float(last["volume"]) / current_vol_ma5
-    if vol_ratio < VOLUME_RATIO_MIN:
-        if verbose:
-            print(f"  [L6-量能] {code} {name} 量比={vol_ratio:.2f} < {VOLUME_RATIO_MIN}")
-        return None, "L6-量比不足"
-
-    # ── 全部通过 ──
-    if verbose:
-        print(f"  [PASS] {code} {name} 6层全通过 | 5日涨={ret_5d*100:.2f}% 20日涨={ret_20d*100:.2f}% ATR%={atr_pct*100:.2f}% 量比={vol_ratio:.2f} 距MA20={dist_ma20*100:.2f}%")
-
-    # 计算价格和评分
-    buy_price = round(close * (1 - BUY_OFFSET_PCT), 2)
-    sell_price = round(buy_price * (1 + TARGET_RETURN), 2)
-    stop_price = round(buy_price * (1 - STOP_LOSS_PCT), 2)
-
-    score = 0.0
-    score += min(ret_5d * 30 / 0.05, 15)
-    score += min(ret_20d * 15 / 0.10, 15)
-
-    if 0.015 <= atr_pct <= 0.025:
-        score += 20
-    elif 0.01 <= atr_pct < 0.015 or 0.025 < atr_pct <= 0.03:
-        score += 10
-
-    score += max(0, (1 - dist_ma20) * 10)
-    if last_ma30.notna().all() and len(ma30_series) >= 10:
-        slope_score = min(ma30_slope * 10 / 0.05, 10)
-        score += slope_score
-
-    if vol_ratio > 1.5:
-        score += 15
-    elif vol_ratio > 1.2:
-        score += 10
-    elif vol_ratio > 1.0:
-        score += 5
-
-    down_days = sum(1 for _, r in tail5.iterrows()
-                    if float(r.get("p_change", 0)) < -2)
-    score += max(0, 15 - down_days * 5)
-
-    if close > open_price:
-        score += 3
-
-    score = round(score, 1)
-
-    result = {
-        "code": code,
-        "name": name,
-        "buy_price": buy_price,
-        "sell_price": sell_price,
-        "stop_price": stop_price,
-        "hold_days": HOLD_DAYS,
-        "score": score,
-        "metrics": {
-            "ret_5d": round(ret_5d * 100, 2),
-            "ret_20d": round(ret_20d * 100, 2),
-            "atr_pct": round(atr_pct * 100, 2),
-            "vol_ratio": round(vol_ratio, 2),
-            "dist_ma20": round(dist_ma20 * 100, 2),
-            "today_change": round(today_change, 2),
-        },
-        "detail": (
-            f"5日涨{ret_5d*100:.1f}% | 20日涨{ret_20d*100:.1f}% | "
-            f"ATR{atr_pct*100:.1f}% | 量比{vol_ratio:.1f} | "
-            f"距MA20 {dist_ma20*100:.1f}%"
-        ),
+    if down_days >= MAX_CONSECUTIVE_DOWN:
+        return False, {}
+    
+    # 涨停/跌停（简化判断）
+    if row['涨跌幅'] >= 0.095 or row['涨跌幅'] <= -0.095:
+        return False, {}
+    if row['振幅'] > MAX_AMPLITUDE * 100:  # akshare振幅单位是%
+        return False, {}
+    if row['涨跌幅'] > MAX_DAILY_CHANGE * 100:
+        return False, {}
+    
+    # 3. 动量确认
+    if row['change_5d'] < MIN_CHANGE_5D:
+        return False, {}
+    if row['change_20d'] < MIN_CHANGE_20D:
+        return False, {}
+    if row['volume_ratio'] < 1.0:  # 量能不萎缩
+        return False, {}
+    
+    # 4. 波动率适配（ATR相对于价格）
+    atr_ratio = row['ATR'] / row['收盘']
+    if not (MIN_ATR <= atr_ratio <= MAX_ATR):
+        return False, {}
+    
+    # 5. 趋势支撑
+    if row['收盘'] < row['MA20']:
+        return False, {}
+    if abs(row['收盘'] / row['MA20'] - 1) > MAX_MA20_DEVIATION:
+        return False, {}
+    if row['MA30'] <= df.iloc[idx-5]['MA30']:  # MA30斜率向上
+        return False, {}
+    
+    # 6. 综合评分
+    score = 0
+    score += min(row['change_5d'] * 50, 20)  # 5日涨幅
+    score += min(row['change_20d'] * 30, 15)  # 20日涨幅
+    score += min(row['volume_ratio'] * 5, 10)  # 量比
+    score += min((atr_ratio - MIN_ATR) * 200, 10)  # ATR适中
+    score += 10 if row['收盘'] > row['MA30'] else 0  # 站上MA30
+    score += (1 - abs(row['收盘']/row['MA20'] - 1) * 50) * 5  # MA20偏离
+    score = max(0, min(100, score))
+    
+    return True, {
+        'score': round(score, 2),
+        'close': row['收盘'],
+        'change_5d': round(row['change_5d'] * 100, 2),
+        'change_20d': round(row['change_20d'] * 100, 2),
+        'atr_ratio': round(atr_ratio * 100, 2),
+        'volume_ratio': round(row['volume_ratio'], 2),
+        'ma20': round(row['MA20'], 2),
+        'ma30': round(row['MA30'], 2),
+        'amplitude': round(row['振幅'], 2)
     }
-    return result, None
 
+def run_selection():
+    """主选股流程"""
+    print(f"开始选股: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    
+    # 确保目录存在
+    ensure_results_dir()
+    
+    # 设置日期范围（获取最近60天数据用于计算）
+    end_date = datetime.now().strftime('%Y%m%d')
+    start_date = (datetime.now() - timedelta(days=90)).strftime('%Y%m%d')
+    
+    # 获取股票列表
+    print("获取股票列表...")
+    stock_codes = get_stock_list()
+    print(f"共 {len(stock_codes)} 只股票待筛选")
+    
+    results = []
+    failed_count = 0
+    
+    for i, code in enumerate(stock_codes):
+        if i % 100 == 0:
+            print(f"进度: {i}/{len(stock_codes)}")
+        
+        # 获取数据
+        df = get_stock_data(code, start_date, end_date)
+        if df is None or len(df) < 20:
+            failed_count += 1
+            continue
+        
+        # 计算指标
+        df = calculate_metrics(df)
+        if df is None:
+            continue
+        
+        # 最新交易日
+        idx = len(df) - 1
+        
+        # 检查条件
+        passed, metrics = check_criteria(df, idx)
+        if not passed:
+            continue
+        
+        # 获取股票名称
+        try:
+            name = ak.stock_individual_info_em(symbol=code)['股票名称'].values[0]
+        except:
+            name = code
+        
+        # 计算买卖价
+        buy_price = round(metrics['close'] * (1 - STOP_LOSS_PCT), 2)  # 低吸挂单（注意：原策略是-0.5%，这里我改成-2%与止损对应，你可以改回）
+        sell_price = round(buy_price * (1 + TARGET_RETURN), 2)
+        stop_price = round(buy_price * (1 - STOP_LOSS_PCT), 2)
+        
+        results.append({
+            'code': code,
+            'name': name,
+            'buy_price': buy_price,
+            'sell_price': sell_price,
+            'stop_price': stop_price,
+            'hold_days': HOLD_DAYS,
+            'score': metrics['score'],
+            'metrics': {
+                '5日涨幅': f"{metrics['change_5d']}%",
+                '20日涨幅': f"{metrics['change_20d']}%",
+                'ATR比率': f"{metrics['atr_ratio']}%",
+                '量比': metrics['volume_ratio'],
+                'MA20': metrics['ma20'],
+                'MA30': metrics['ma30'],
+                '振幅': f"{metrics['amplitude']}%",
+                '收盘价': metrics['close']
+            },
+            'detail': f"站上MA20, MA30向上, 5日{metrics['change_5d']}%, 20日{metrics['change_20d']}%, ATR{metrics['atr_ratio']}%"
+        })
+        
+        # 只取前10只
+        if len(results) >= 10:
+            break
+    
+    # 按分数排序
+    results = sorted(results, key=lambda x: x['score'], reverse=True)[:10]
+    
+    print(f"筛选完成: 成功分析 {len(stock_codes) - failed_count} 只, 选出 {len(results)} 只")
+    print(f"失败/无数据: {failed_count} 只")
+    
+    # 保存结果
+    output_file = os.path.join(
+        get_project_root(), 
+        "results", 
+        f"selection_{datetime.now().strftime('%Y%m%d')}.json"
+    )
+    
+    with open(output_file, 'w', encoding='utf-8') as f:
+        json.dump({
+            'date': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            'total_analyzed': len(stock_codes) - failed_count,
+            'selected_count': len(results),
+            'stocks': results
+        }, f, ensure_ascii=False, indent=2)
+    
+    print(f"结果已保存至: {output_file}")
+    
+    # 打印结果摘要
+    if results:
+        print("\n=== 选股结果 ===")
+        for r in results:
+            print(f"{r['code']} {r['name']} | 评分: {r['score']} | 买入: {r['buy_price']} 卖出: {r['sell_price']}")
+    else:
+        print("\n今日无符合条件的股票（空仓等待）")
+    
+    return results
 
-# ═══════════════════════════════════════════════════════════
-# 主流程
-# ═══════════════════════════════════════════════════════════
-def main():
-    parser = argparse.ArgumentParser(description="A 股每日选股 — 5日5%策略")
-    parser.add_argument("--date", type=str, default=None, help="日期 YYYY-MM-DD，默认今天")
-    parser.add_argument("--verbose", action="store_true", help="逐只输出筛选日志（调试用）")
-    parser.add_argument("--sample", type=int, default=0, help="只扫描前N只股票（调试用，0=全部）")
-    args = parser.parse_args()
-    target_date = args.date if args.date else date.today().isoformat()
-    verbose = args.verbose
-    sample_n = args.sample
-
-    print(f"╔══════════════════════════════════════════════════════╗")
-    print(f"║  A股每日选股 — 5日5%策略 v2（带诊断日志）              ║")
-    print(f"║  目标日期: {target_date}                                ║")
-    print(f"║  买入价=收盘价-0.5% | 卖出价=买入价+5% | 止损=买入价-2% ║")
-    print(f"║  持有期=5交易日 | 盈亏比=2.5                         ║")
-    print(f"╚══════════════════════════════════════════════════════╝")
-    if verbose:
-        print("[*] 详细日志模式: ON")
-    if sample_n > 0:
-        print(f"[*] 采样模式: 只扫描前 {sample_n} 只")
-
+# ==================== 入口 ====================
+if __name__ == "__main__":
     try:
-        print(f"\n[1/3] 获取A股列表...")
-        all_stocks = get_all_stocks()
-        if not all_stocks:
-            print("[-] 无法获取股票列表，退出")
-            sys.exit(1)
-
-        # 采样模式：只扫前 N 只（调试用）
-        work_list = all_stocks[:sample_n] if sample_n > 0 else all_stocks
-
-        print(f"\n[2/3] 筛选股票（共 {len(all_stocks)} 只，本次扫描 {len(work_list)} 只）...")
-        results = []
-        errors = 0
-        checked = 0
-        fail_stats = {}  # 统计各层失败次数
-
-        for i, stock in enumerate(work_list):
-            checked += 1
-            if not verbose and checked % 200 == 0:
-                print(f"  ... 已扫描 {checked}/{len(work_list)}，通过 {len(results)} 只")
-
-            code = stock["code"]
-            name = stock["name"]
-
-            df = pd.DataFrame()
-            for attempt in range(1, MAX_RETRIES + 1):
-                try:
-                    df = get_stock_hist(code)
-                    break
-                except Exception:
-                    if attempt < MAX_RETRIES:
-                        time.sleep(RETRY_DELAY)
-
-            if df.empty or len(df) < 40:
-                fail_stats["L0-数据不足"] = fail_stats.get("L0-数据不足", 0) + 1
-                if verbose:
-                    print(f"  [L0-数据不足] {code} {name} 历史数据不足40条")
-                continue
-
-            try:
-                result, fail_layer = screen_stock(code, name, stock, df, verbose=verbose)
-                if result:
-                    results.append(result)
-                else:
-                    fail_stats[fail_layer] = fail_stats.get(fail_layer, 0) + 1
-            except Exception as e:
-                errors += 1
-                print(f"  [!] {code} {name} 异常: {e}")
-
-            if not verbose:
-                time.sleep(0.1)
-
-        # ── 输出各层过滤统计 ──
-        print(f"\n{'='*60}")
-        print(f"  各层过滤统计（共扫描 {checked} 只，通过 {len(results)} 只）")
-        print(f"{'='*60}")
-        if fail_stats:
-            for layer, cnt in sorted(fail_stats.items(), key=lambda x: -x[1]):
-                pct = cnt / checked * 100 if checked > 0 else 0
-                print(f"  {layer:<25} 淘汰 {cnt:>5} 只 ({pct:>5.1f}%)")
-        else:
-            print("  （全部通过或采样为0）")
-        print(f"{'='*60}")
-
-        print(f"\n[3/3] 整理结果...")
-        results.sort(key=lambda x: x["score"], reverse=True)
-        final_stocks = results[:MAX_RESULTS]
-
-        output = {
-            "date": target_date,
-            "strategy": "5日5%策略",
-            "description": (
-                f"买入价=收盘价-0.5%，卖出价=买入价+5%，"
-                f"止损价=买入价-2%，持有{HOLD_DAYS}个交易日，盈亏比2.5"
-            ),
-            "stock_count": len(final_stocks),
-            "stocks": final_stocks,
-            "filter_stats": {k: v for k, v in sorted(fail_stats.items(), key=lambda x: -x[1])},
-        }
-
-        os.makedirs("results", exist_ok=True)
-        output_path = f"results/{target_date}.json"
-        with open(output_path, "w", encoding="utf-8") as f:
-            json.dump(output, f, ensure_ascii=False, indent=2)
-
-        print(f"\n{'='*60}")
-        print(f"[+] 结果已保存到 {output_path}")
-        print(f"[+] 扫描 {checked} 只，通过 {len(results)} 只，输出 {len(final_stocks)} 只，错误 {errors} 次")
-        print(f"{'='*60}")
-
-        if final_stocks:
-            print(f"\n{'代码':<8} {'名称':<8} {'评分':>4} {'买入价':>8} {'卖出价':>8} {'止损价':>8} {'详情'}")
-            print(f"{'-'*8} {'-'*8} {'-'*4} {'-'*8} {'-'*8} {'-'*8} {'-'*40}")
-            for s in final_stocks:
-                print(
-                    f"{s['code']:<8} {s['name']:<8} {s['score']:>4.0f} "
-                    f"{s['buy_price']:>8.2f} {s['sell_price']:>8.2f} {s['stop_price']:>8.2f} "
-                    f"{s['detail']}"
-                )
-        else:
-            print("\n[!] 今日无符合条件的股票。策略较为严格是正常的，")
-            print("    这意味着市场上没有高确定性的5日5%机会。")
-            print("    建议空仓等待，不操作就是最好的操作。")
-
-        sys.exit(0)
-
+        run_selection()
     except Exception as e:
-        print(f"[-] 运行失败: {e}")
+        print(f"程序运行出错: {e}")
         import traceback
         traceback.print_exc()
         sys.exit(1)
-
-
-if __name__ == "__main__":
-    main()
