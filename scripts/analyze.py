@@ -132,7 +132,58 @@ def grade(score):
     if score >= 36: return ("偏弱", "s-d")
     return ("回避", "s-e")
 
+# ── 准入护栏（融合旧规则的硬护栏，作为打分前的资格过滤）──
+# 旧规则「全市场 AND 硬门槛 + akshare 限流」是其空集根因，范式已弃；
+# 但其中一组风控护栏今日模型缺失，这里提取为独立准入层。
+# 单位：龙虎榜 accum_amount/free_mcap 为「元」；同花顺 chengjiaoe 为「万元」。
+ST_EXCLUDE = ("ST", "*", "退")          # 名称含 ST / *ST / 退市
+MIN_MCAP = 5e9                          # 流通市值 ≥ 50 亿（元）
+MIN_AMOUNT = 5e7                        # 成交额 ≥ 5000 万（元）
+PRICE_LO, PRICE_HI = 3, 1500            # 价格区间（元，仅防仙股/退市整理，不误杀高价绩优股）
+ATR_LO, ATR_HI = 0.01, 0.15            # ATR 比率 1%~15%（仅排除僵尸股<1% 与极端狂热>15%）
+MIN_VOLR = 1.0                          # 量比 ≥ 1
+
+def admission_guard(code, s, tk):
+    """返回 (passed, reason)。不通过则踢出候选池。"""
+    name = s.get("name") or ""
+    # 1) 板块：科创板 688 / 北交所 4-8 开头
+    if code.startswith("688"):
+        return False, "科创板688"
+    if code.startswith(("4", "8")):
+        return False, "北交所"
+    # 2) ST / 退市（今日模型此前为裸，真实缺口）
+    if any(k in name.upper() for k in ST_EXCLUDE):
+        return False, "ST/退市"
+    # 3) 价格区间
+    close = tk.get("last_close") or 0
+    if not (PRICE_LO <= close <= PRICE_HI):
+        return False, f"价格越界({close})"
+    # 数据来源：龙虎榜票 free_mcap>0；同花顺补全票 free_mcap=0（chengjiaoe 为万元）
+    is_lhb = (s.get("free_mcap") or 0) > 0
+    # 4) 排除当日涨停（仅对非龙虎榜的纯题材强势股生效；
+    #    龙虎榜票涨停是上榜信号，豁免以免清空主力候选池）
+    if not is_lhb and (s.get("change_pct") or 0) >= 9.5:
+        return False, "当日涨停"
+    # 5) 市值 ≥ 50 亿（仅龙虎榜票有可靠市值；ths 补全票数据缺失，跳过以免误杀）
+    if is_lhb and (s.get("free_mcap") or 0) < MIN_MCAP:
+        return False, "市值<50亿"
+    # 6) 成交额 ≥ 5000 万（龙虎榜:元；ths补全:万元×1e4）
+    amt = (s.get("accum_amount") or 0) * (1e4 if not is_lhb else 1)
+    if amt < MIN_AMOUNT:
+        return False, "成交额<5000万"
+    # 7) ATR 比率 1%~5%（波动率护栏：排除僵尸股与极度狂热）
+    atr = tk.get("atr14") or 0
+    if close > 0:
+        ar = atr / close
+        if not (ATR_LO <= ar <= ATR_HI):
+            return False, f"波动率异常({ar:.0%})"
+    # 8) 量比 ≥ 1（量能不萎缩）
+    if (tk.get("vol_ratio5") or 0) < MIN_VOLR:
+        return False, "量比<1"
+    return True, ""
+
 candidates = []
+excluded = {}                            # 护栏踢出统计：reason -> [name,...]
 pool = {s["code"]: s for s in stock_agg}
 for r in ths:
     pool.setdefault(r["code"], {
@@ -146,6 +197,10 @@ for r in ths:
 for code, s in pool.items():
     tk = tech.get(code)
     if not tk:                      # 北交所/次新/可转债：历史不足，不进入推荐池
+        continue
+    ok, why = admission_guard(code, s, tk)
+    if not ok:
+        excluded.setdefault(why, []).append(s.get("name") or code)
         continue
     tags, theme_raw = cand_raw.get(code, ([], 0))
     close = tk["last_close"]; atr = tk["atr14"] or max(close * 0.03, 0.01)
@@ -342,6 +397,9 @@ print(f"龙虎榜 {len(lhb)} 条 / {len(stock_agg)} 只 | 净买合计 {lhb_tota
 print(f"题材 {len(themes)} 个 / 标签 {total_tags} 次 | 强势股 {len(ths)} 只")
 print(f"行业 {len(industries)}/{len(board_names)} 个 | 上涨 {len(ind_up)} 下跌 {len(ind_dn)}")
 print(f"候选 {len(candidates)} 只 → 推荐 {len(shortlist)} 只")
+print("护栏踢出:", {k: len(v) for k, v in sorted(excluded.items(), key=lambda x: -len(x[1]))})
+for k, v in sorted(excluded.items(), key=lambda x: -len(x[1])):
+    print(f"  · {k}: {', '.join(v[:12])}{' …' if len(v) > 12 else ''}")
 print("TOP题材:", [(t['tag'], t['count']) for t in themes[:8]])
 print("领涨行业:", [(i['name'], i['change_pct']) for i in industries[:5]])
 print("领跌行业:", [(i['name'], i['change_pct']) for i in industries[-5:]])
