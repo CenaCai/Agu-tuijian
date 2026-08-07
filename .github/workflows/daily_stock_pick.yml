@@ -1,21 +1,22 @@
-name: 每日 A 股选股推送
+name: 每日 A 股情绪日报
 
 on:
   schedule:
-    - cron: '0 12 * * *' # UTC 12:00 = 北京时间 20:00
-  workflow_dispatch: # 允许手动触发
+    - cron: '0 12 * * *'   # UTC 12:00 = 北京时间 20:00
+  workflow_dispatch:       # 允许手动触发（Actions 页面 → Run workflow）
 
 permissions:
   contents: write
 
 jobs:
-  run-and-commit:
+  build:
     runs-on: ubuntu-latest
+    timeout-minutes: 300   # 腾讯行情接口限频，全市场宽度采集可能耗时，给足时间
     steps:
       - name: 检出代码
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0 # 获取完整历史，便于后续 push
+          fetch-depth: 0
 
       - name: 设置 Python 环境
         uses: actions/setup-python@v5
@@ -27,17 +28,15 @@ jobs:
           pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: 运行选股脚本
-        run: |
-          python scripts/run_selection.py --date $(date +%Y-%m-%d)
-          echo "选股完成，结果在 results/ 目录"
+      - name: 生成当日情绪日报
+        run: python scripts/run_daily.py
 
-      - name: 提交并推送结果
+      - name: 提交结果
         uses: Endbug/add-and-commit@v9
         with:
           default_author_email: "bot@users.noreply.github.com"
           default_author_name: "schedule-bot"
-          message: "🤖 自动更新选股结果 (${{ github.run_date }})"
-          add: "results/*.json"
+          message: "🤖 自动更新 A股情绪日报 (${{ github.run_date }})"
+          add: "report.html report_data.json"
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
